@@ -5,7 +5,7 @@ LDFLAGS = -pthread -lm
 SRC_DIR   = src
 INC_DIR   = include
 TEST_DIR  = test
-BUILD_DIR = build
+BUILD_DIR = build$(if $(LAYOUT_TAG),/$(LAYOUT_TAG))
 
 # ------------------------------------------------------------------ #
 # Build options        												 #
@@ -18,6 +18,9 @@ ASAN			?= 0
 STATS			?= 1
 CHECK_STRUCTURE ?= 0
 OPT             ?= 3
+
+# LAYOUT=path/to/layout.h (default include/layout/baseline.h); builds into build/<name>/.
+LAYOUT          ?=
 
 ifeq ($(DEBUG),1)
     CFLAGS += -O0 -g -DDEBUG
@@ -39,6 +42,16 @@ endif
 
 ifeq ($(CHECK_STRUCTURE),1)
     CFLAGS += -DCHECK_STRUCTURE=1
+endif
+
+ifneq ($(LAYOUT),)
+    ifeq ($(wildcard $(LAYOUT)),)
+        $(error LAYOUT file '$(LAYOUT)' not found)
+    endif
+    ifneq ($(abspath $(LAYOUT)),$(abspath $(INC_DIR)/layout/baseline.h))
+        LAYOUT_TAG = $(basename $(notdir $(LAYOUT)))
+        CFLAGS += -DBSL_LAYOUT_HEADER=\"$(abspath $(LAYOUT))\"
+    endif
 endif
 
 # ------------------------------------------------------------------ #

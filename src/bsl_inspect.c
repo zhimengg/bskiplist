@@ -3,31 +3,38 @@
 #include <stdio.h>
 #include <stdint.h>
 
-static node_header_t *
+static bsl_node_t *
 leaf_head(bsl_t *list)
 {
-    return (node_header_t *)list->headers[0];
+    return list->headers[0];
 }
 
-static node_header_t *
+static bsl_node_t *
 level_head(bsl_t *list, int level)
 {
-    return (node_header_t *)list->headers[level];
+    return list->headers[level];
 }
 
 static void
 collect_stats(bsl_t *list, bsl_inspect_result_t *r)
 {
-    node_header_t *curr = leaf_head(list);
+    double fill_used  = 0;
+    double fill_limit = 0;
+
+    bsl_node_t *curr = leaf_head(list);
     while (curr)
     {
-        uint32_t       num  = curr->num_elts;
-        node_header_t *next = (node_header_t *)curr->next;
+        uint32_t    num  = node_count(curr);
+        bsl_node_t *next = node_next(curr);
+        size_t      used, limit;
+        node_fill(curr, &used, &limit);
 
         r->total_keys += num;
         r->total_leaves++;
+        fill_used  += (double)used;
+        fill_limit += (double)limit;
 
-        int idx = (int)((float)num / (float)B_LEAF * 10.0f);
+        int idx = (int)((float)used / (float)limit * 10.0f);
         if (idx > 10) idx = 10;
         r->fill_buckets[idx]++;
 
@@ -36,10 +43,10 @@ collect_stats(bsl_t *list, bsl_inspect_result_t *r)
 
     for (int lv = 1; lv < MAX_LEVEL; lv++)
     {
-        node_header_t *curr = level_head(list, lv);
+        bsl_node_t *curr = level_head(list, lv);
         while (curr)
         {
-            node_header_t *next = (node_header_t *)curr->next;
+            bsl_node_t *next = node_next(curr);
             r->total_internals++;
             curr = next;
         }
@@ -47,8 +54,7 @@ collect_stats(bsl_t *list, bsl_inspect_result_t *r)
 
     if (r->total_leaves > 0)
     {
-        r->avg_leaf_fill = (double)r->total_keys /
-                           ((double)r->total_leaves * (double)B_LEAF);
+        r->avg_leaf_fill = fill_used / fill_limit;
     }
 }
 
@@ -62,14 +68,17 @@ bsl_inspect_order(bsl_t *list, bsl_val_t *checksum_out)
     int            is_first = 1;
     bsl_key_t      prev     = 0;
     bsl_val_t      sum      = 0;
-    node_header_t *curr     = leaf_head(list);
+    bsl_node_t    *curr     = leaf_head(list);
+    bsl_key_t      buf_keys[BSL_SCAN_BUFFER_LEN];
+    bsl_val_t      buf_vals[BSL_SCAN_BUFFER_LEN];
 
     while (curr)
     {
-        uint32_t       num  = curr->num_elts;
-        bsl_key_t     *keys = NODE_KEYS(curr);
-        bsl_val_t     *vals = LEAF_VALUES(curr);
-        node_header_t *next = (node_header_t *)curr->next;
+        const bsl_key_t *keys;
+        const bsl_val_t *vals;
+        uint32_t    num  = (uint32_t)leaf_scan(curr, BSL_KEY_MIN, LEAF_MAX_ENTRIES,
+                                               buf_keys, buf_vals, &keys, &vals);
+        bsl_node_t *next = node_next(curr);
 
         for (uint32_t i = 0; i < num; i++)
         {
@@ -107,18 +116,19 @@ bsl_inspect_index(bsl_t *list)
 
     for (int lv = MAX_LEVEL - 1; lv > 0; lv--)
     {
-        node_header_t *curr = level_head(list, lv);
+        bsl_node_t *curr = level_head(list, lv);
         if (!curr) continue;
 
         while (curr)
         {
-            uint32_t    num      = curr->num_elts;
-            bsl_key_t  *keys     = NODE_KEYS(curr);
-            void      **children = INTERNAL_CHILDREN(curr);
+            bsl_key_t   keys[INTERNAL_MAX_ENTRIES];
+            bsl_node_t *children[INTERNAL_MAX_ENTRIES];
+            uint32_t    num = (uint32_t)internal_entries(curr, INTERNAL_MAX_ENTRIES,
+                                                         keys, children);
 
             for (uint32_t i = 0; i < num; i++)
             {
-                node_header_t *child = (node_header_t *)children[i];
+                bsl_node_t *child = children[i];
                 if (!child)
                 {
                     printf("  index FAIL: level %d node %p child[%u] is NULL\n",
@@ -127,7 +137,7 @@ bsl_inspect_index(bsl_t *list)
                     continue;
                 }
 
-                bsl_key_t child_hdr = NODE_KEYS(child)[0];
+                bsl_key_t child_hdr = node_first_key(child);
 
                 if (child_hdr != keys[i])
                 {
@@ -139,7 +149,7 @@ bsl_inspect_index(bsl_t *list)
                 }
             }
 
-            node_header_t *next = (node_header_t *)curr->next;
+            bsl_node_t *next = node_next(curr);
             curr = next;
         }
     }
@@ -157,11 +167,11 @@ bsl_inspect_levels(bsl_t *list)
 
     for (int lv = 0; lv < MAX_LEVEL; lv++)
     {
-        node_header_t *curr = level_head(list, lv);
+        bsl_node_t *curr = level_head(list, lv);
         while (curr)
         {
-            uint32_t       stored_lv = curr->level;
-            node_header_t *next      = (node_header_t *)curr->next;
+            uint32_t    stored_lv = (uint32_t)node_level(curr);
+            bsl_node_t *next      = node_next(curr);
 
             if ((int)stored_lv != lv)
             {
@@ -187,15 +197,15 @@ bsl_inspect_next_headers(bsl_t *list)
 
     for (int lv = 0; lv < MAX_LEVEL; lv++)
     {
-        node_header_t *curr = level_head(list, lv);
+        bsl_node_t *curr = level_head(list, lv);
         while (curr)
         {
-            bsl_key_t      cached_nh = curr->next_header;
-            node_header_t *next      = (node_header_t *)curr->next;
+            bsl_key_t   cached_nh = node_next_header(curr);
+            bsl_node_t *next      = node_next(curr);
 
             if (next)
             {
-                bsl_key_t actual_hdr = NODE_KEYS(next)[0];
+                bsl_key_t actual_hdr = node_first_key(next);
 
                 if (cached_nh != actual_hdr)
                 {

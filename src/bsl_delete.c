@@ -26,37 +26,23 @@
 #include <assert.h>
 #include <unistd.h>
 
-static inline void delete_internal_slot(void *node, uint32_t rank)
+/*
+ * Looks key up in node. *first_key: key is the node's first key. A leaf
+ * entry that is not a first key is removed here (leaf_remove).
+ */
+static inline int
+delete_find(bsl_node_t *node, int level, bsl_key_t key, int *first_key,
+            bsl_node_t **child, bsl_node_t **left_child)
 {
-    node_header_t *h = (node_header_t *)node;
-    bsl_key_t *keys = NODE_KEYS(node);
-    void **children = INTERNAL_CHILDREN(node);
-
-    int num_to_move = h->num_elts - rank - 1;
-    if (num_to_move > 0)
+    if (level == 0)
     {
-        memmove(keys + rank, keys + rank + 1, num_to_move * sizeof(bsl_key_t));
-        memmove(children + rank, children + rank + 1, num_to_move * sizeof(void *));
+        *first_key = (node_first_key(node) == key);
+        return *first_key || leaf_remove(node, key);
     }
 
-    __atomic_sub_fetch(&h->num_elts, 1, __ATOMIC_RELAXED);
-}
-
-static inline void delete_leaf_slot(void *node, uint32_t rank)
-{
-    node_header_t *h = (node_header_t *)node;
-    bsl_key_t *keys = NODE_KEYS(node);
-    bsl_val_t *values = LEAF_VALUES(node);
-
-    int num_to_move = h->num_elts - rank - 1;
-
-    if (num_to_move > 0)
-    {
-        memmove(keys + rank, keys + rank + 1, num_to_move * sizeof(bsl_key_t));
-        memmove(values + rank, values + rank + 1, num_to_move * sizeof(bsl_val_t));
-    }
-
-    __atomic_sub_fetch(&h->num_elts, 1, __ATOMIC_RELAXED);
+    int found = internal_find(node, key, child, left_child);
+    *first_key = found && *left_child == NULL;
+    return found;
 }
 
 
@@ -69,15 +55,15 @@ static inline int _bsl_delete(bsl_t *list, bsl_key_t key)
 
 top_retry:;
 
-    node_header_t *curr = list->headers[MAX_LEVEL - 1];
+    bsl_node_t *curr = list->headers[MAX_LEVEL - 1];
     hocc64_t curr_v = NODE_LOAD_VERSION(curr);
 
     int level;
     for (level = MAX_LEVEL - 1; level > level_to_promote; level--)
     {
-        while (LOAD_RELAXED(curr->next_header) <= key)
+        while (node_next_header(curr) <= key)
         {
-            node_header_t *next = LOAD_RELAXED(curr->next);
+            bsl_node_t *next = node_next(curr);
             if (next == NULL)
             {
                 RECORD_RETRY();
@@ -96,10 +82,7 @@ top_retry:;
             curr_v = next_v;
         }
 
-        bsl_key_t *keys = NODE_KEYS(curr);
-        uint32_t rank = find_rank(keys, LOAD_RELAXED(curr->num_elts), key);
-        
-        node_header_t *child = LOAD_RELAXED(INTERNAL_CHILDREN(curr)[rank]);
+        bsl_node_t *child = internal_route(curr, key);
         if (child == NULL)
         {
             RECORD_RETRY();
@@ -135,21 +118,20 @@ top_retry:;
         goto top_retry;
     }
 
-    bsl_key_t *keys = NODE_KEYS(curr);
-    uint32_t rank = find_rank_linear(keys, curr->num_elts, key);
-    int found_key = (keys[rank] == key);
+    int first_key = 0;
+    bsl_node_t *found_child = NULL;
+    bsl_node_t *found_left = NULL;
+    int found_key = delete_find(curr, level, key, &first_key, &found_child, &found_left);
 
-    node_header_t *prev = NULL;
+    bsl_node_t *prev = NULL;
 
-    while (!found_key && curr->next_header <= key)
+    while (!found_key && node_next_header(curr) <= key)
     {
-        NODE_WRITE_LOCK(curr->next);
+        NODE_WRITE_LOCK(node_next(curr));
         prev = curr;
-        curr = curr->next;
+        curr = node_next(curr);
 
-        keys = NODE_KEYS(curr);
-        rank = find_rank_linear(keys, curr->num_elts, key);
-        found_key = (keys[rank] == key);
+        found_key = delete_find(curr, level, key, &first_key, &found_child, &found_left);
 
         if (!found_key) 
             NODE_WRITE_UNLOCK(prev);
@@ -161,16 +143,14 @@ top_retry:;
         return 0;
     }
 
-    assert(NODE_KEYS(curr)[rank] == key);
+    bsl_node_t *current;
+    bsl_node_t *left_node;
 
-    node_header_t *current;
-    node_header_t *left_node;
-
-    if (rank != 0)
+    if (!first_key)
     {
-        if (curr->level == 0)
+        if (level == 0)
         {
-            delete_leaf_slot(curr, rank);
+            /* already removed by delete_find (leaf_remove) */
             if (prev) 
                 NODE_WRITE_UNLOCK(prev);
             NODE_WRITE_UNLOCK(curr);
@@ -178,11 +158,10 @@ top_retry:;
         }
         else
         {
-            node_header_t **children = (node_header_t **)INTERNAL_CHILDREN(curr);
-            current = children[rank];
-            left_node = children[rank - 1];
+            current = found_child;
+            left_node = found_left;
 
-            delete_internal_slot(curr, rank);
+            internal_remove(curr, key);
 
             NODE_WRITE_LOCK(left_node);
             NODE_WRITE_LOCK(current);
@@ -202,38 +181,38 @@ top_retry:;
     assert(left_node && current);
 
     prev = NULL;
-    for (level = current->level; level > 0; level--)
+    for (level = node_level(current); level > 0; level--)
     {
-        while (left_node->next != current)
+        while (node_next(left_node) != current)
         {
-            NODE_WRITE_LOCK(left_node->next);
+            NODE_WRITE_LOCK(node_next(left_node));
             prev = left_node;
-            left_node = left_node->next;
+            left_node = node_next(left_node);
             NODE_WRITE_UNLOCK(prev);
         }
 
-        assert(NODE_KEYS(current)[0] == key);
-        assert(left_node->next_header == key);
+        assert(node_first_key(current) == key);
+        assert(node_next_header(left_node) == key);
 
-        node_header_t *old_curr = current;
-        node_header_t *old_left = left_node;
+        bsl_node_t *old_curr = current;
+        bsl_node_t *old_left = left_node;
 
-        current = INTERNAL_CHILDREN(current)[0];
-        left_node = INTERNAL_CHILDREN(left_node)[left_node->num_elts - 1];
+        current = internal_first_child(current);
+        left_node = internal_last_child(left_node);
 
-        if (old_curr->num_elts == 1)
+        if (node_count(old_curr) == 1)
         {
-            STORE_RELAXED(old_left->next_header, old_curr->next_header);
-            STORE_RELAXED(old_left->next, old_curr->next);
-            STORE_RELAXED(old_curr->num_elts, 0);
+            node_set_next_header(old_left, node_next_header(old_curr));
+            node_set_next(old_left, node_next(old_curr));
+            internal_remove(old_curr, key);     /* its last entry */
 
             NODE_WRITE_UNLOCK(old_curr);
             ebr_retire(old_curr);
         }
         else
         {
-            delete_internal_slot(old_curr, 0);
-            STORE_RELAXED(old_left->next_header, NODE_KEYS(old_curr)[0]);
+            internal_remove(old_curr, key);
+            node_set_next_header(old_left, node_first_key(old_curr));
             NODE_WRITE_UNLOCK(old_curr);
         }
 
@@ -242,29 +221,29 @@ top_retry:;
         NODE_WRITE_UNLOCK(old_left);
     }
 
-    assert(current->level == 0 && left_node->level == 0);
+    assert(node_level(current) == 0 && node_level(left_node) == 0);
 
     prev = NULL;
-    while (left_node->next != current)
+    while (node_next(left_node) != current)
     {
-        NODE_WRITE_LOCK(left_node->next);
+        NODE_WRITE_LOCK(node_next(left_node));
         prev = left_node;
-        left_node = left_node->next;
+        left_node = node_next(left_node);
         NODE_WRITE_UNLOCK(prev);
     }
 
-    if (current->num_elts == 1)
+    if (node_count(current) == 1)
     {
-        STORE_RELAXED(left_node->next_header, current->next_header);
-        STORE_RELAXED(left_node->next, current->next);
-        STORE_RELAXED(current->num_elts, 0);
+        node_set_next_header(left_node, node_next_header(current));
+        node_set_next(left_node, node_next(current));
+        leaf_remove(current, key);              /* its last entry */
         NODE_WRITE_UNLOCK(current);
         ebr_retire(current);
     }
     else
     {
-        delete_leaf_slot(current, 0);
-        STORE_RELAXED(left_node->next_header, NODE_KEYS(current)[0]);
+        leaf_remove(current, key);
+        node_set_next_header(left_node, node_first_key(current));
         NODE_WRITE_UNLOCK(current);
     }
 

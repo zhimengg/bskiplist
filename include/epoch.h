@@ -47,7 +47,7 @@ void epoch_exit(void);
  * ebr_retire - mark a node for deferred reclamation
  *
  * Call after the node has been unlinked from the data structure.
- * The node's tail bytes (NODE_GC_NEXT_OFFSET) are used as an
+ * The node's retirement link (node_retire_link) is used as an
  * intrusive link; no wrapper allocation or free callback is needed.
  * ptr must not be NULL.
  */

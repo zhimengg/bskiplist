@@ -25,57 +25,6 @@
 #include <assert.h>
 
 static inline int 
-split_keys(void *src_node, void *dst_node, uint32_t start_rank, int dst_offset) 
-{
-    node_header_t *src_h = (node_header_t *)src_node;
-    node_header_t *dst_h = (node_header_t *)dst_node;
-    
-    uint32_t move_cnt = src_h->num_elts - start_rank;
-    assert(start_rank <= src_h->num_elts);
-
-    bsl_key_t *src_keys = NODE_KEYS(src_node);
-    bsl_key_t *dst_keys = NODE_KEYS(dst_node);
-
-    memmove(dst_keys + dst_offset, src_keys + start_rank, move_cnt * sizeof(bsl_key_t));
-
-    STORE_RELAXED(src_h->num_elts, (uint32_t)start_rank);
-    __atomic_add_fetch(&dst_h->num_elts, (uint32_t)move_cnt, __ATOMIC_RELAXED);
-    return move_cnt;
-}
-
-static inline void
-insert_internal_slot(void *node, int rank, bsl_key_t key, void *child)
-{
-    node_header_t *h = (node_header_t *)node;
-    bsl_key_t *keys = NODE_KEYS(node);
-    void **children = INTERNAL_CHILDREN(node);
-
-    memmove(keys + rank + 1, keys + rank, (h->num_elts - rank) * sizeof(bsl_key_t));
-    memmove(children + rank + 1, children + rank, (h->num_elts - rank) * sizeof(void *));
-
-    STORE_RELAXED(keys[rank], key);
-    STORE_RELAXED(children[rank], child);
-
-    __atomic_add_fetch(&h->num_elts, 1, __ATOMIC_RELAXED);
-}
-
-static inline void
-insert_leaf_slot(void *node, int rank, bsl_key_t key, bsl_val_t value)
-{
-    node_header_t *h = (node_header_t *)node;
-    bsl_key_t *keys = NODE_KEYS(node);
-    bsl_val_t *values = LEAF_VALUES(node);
-
-    memmove(keys + rank + 1, keys + rank, (h->num_elts - rank) * sizeof(bsl_key_t));
-    memmove(values + rank + 1, values + rank, (h->num_elts - rank) * sizeof(bsl_val_t));
-
-    STORE_RELAXED(keys[rank], key);
-    STORE_RELAXED(values[rank], value);
-
-    __atomic_add_fetch(&h->num_elts, 1, __ATOMIC_RELAXED);
-}
-
-static inline int 
 _bsl_insert(bsl_t *list, bsl_key_t key, bsl_val_t value)
 {
     if (key <= BSL_KEY_MIN || key >= BSL_KEY_MAX)
@@ -83,24 +32,26 @@ _bsl_insert(bsl_t *list, bsl_key_t key, bsl_val_t value)
 
     int level_to_promote = bsl_level_for_key(key);
 
-    void* new_nodes[MAX_LEVEL] = {0}; 
+    /* new_nodes[i] is split off at level level_to_promote - 1 - i. */
+    bsl_node_t* new_nodes[MAX_LEVEL] = {0}; 
     for (int i = 0; i < level_to_promote; i++)
     {
-        new_nodes[i] = bsl_node_alloc();
+        int node_lv = level_to_promote - 1 - i;
+        new_nodes[i] = node_lv > 0 ? bsl_internal_alloc(node_lv) : bsl_leaf_alloc();
         NODE_WRITE_LOCK(new_nodes[i]);
     }
 
 top_retry:;
 
-    node_header_t *curr = list->headers[MAX_LEVEL - 1];
+    bsl_node_t *curr = list->headers[MAX_LEVEL - 1];
     hocc64_t curr_v = NODE_LOAD_VERSION(curr);
 
     int level;
     for (level = MAX_LEVEL - 1; level > level_to_promote; level--)
     {
-        while (LOAD_RELAXED(curr->next_header) <= key)
+        while (node_next_header(curr) <= key)
         {
-            node_header_t *next = LOAD_RELAXED(curr->next);
+            bsl_node_t *next = node_next(curr);
             if (next == NULL)
             {
                 RECORD_RETRY();
@@ -118,10 +69,7 @@ top_retry:;
             curr_v = next_v;
         }
 
-        bsl_key_t *keys = NODE_KEYS(curr);
-        int rank = find_rank(keys, LOAD_RELAXED(curr->num_elts), key);
-        
-        node_header_t *child = LOAD_RELAXED(INTERNAL_CHILDREN(curr)[rank]);
+        bsl_node_t *child = internal_route(curr, key);
         if (child == NULL) goto top_retry;
         
         /* two-phase HOH validation, see bsl_get.c */
@@ -142,9 +90,9 @@ top_retry:;
         curr = child;
         curr_v = child_v;
     }
-    while (LOAD_RELAXED(curr->next_header) <= key)
+    while (node_next_header(curr) <= key)
     {
-        node_header_t *next = LOAD_RELAXED(curr->next);
+        bsl_node_t *next = node_next(curr);
 
         if (next == NULL)
         {
@@ -174,29 +122,39 @@ top_retry:;
         goto top_retry;
     }
 
-    bsl_key_t *keys = NODE_KEYS(curr);
-    uint32_t rank = find_rank_linear(keys, curr->num_elts, key);
-    int found_key = (keys[rank] == key);
+    int put = BSL_FULL;
+    int found_key;
+    bsl_node_t *found_child = NULL;
+
+    if (level == 0)
+    {
+        put = leaf_upsert(curr, key, value);
+        found_key = (put == BSL_UPDATED);
+    }
+    else
+    {
+        bsl_node_t *found_left;
+        found_key = internal_find(curr, key, &found_child, &found_left);
+    }
 
     if (found_key)
     {
-        if (curr->level == 0)
+        if (level == 0)
         {
             assert(level_to_promote == 0);
-            STORE_RELAXED(LEAF_VALUES(curr)[rank], value);
             NODE_WRITE_UNLOCK(curr);
             return 1;
         }
         else
         {
-            node_header_t *child = (node_header_t *)INTERNAL_CHILDREN(curr)[rank];
+            bsl_node_t *child = found_child;
             hocc64_t child_v = NODE_LOAD_VERSION(child);
             
             NODE_WRITE_UNLOCK(curr);
             
-            while (LOAD_RELAXED(child->level) > 0)
+            while (node_level(child) > 0)
             {
-                node_header_t *next_child = (node_header_t *)INTERNAL_CHILDREN(child)[0];
+                bsl_node_t *next_child = internal_first_child(child);
                 if (next_child == NULL)
                 {
                     RECORD_RETRY();
@@ -230,86 +188,71 @@ top_retry:;
                 goto top_retry;
             }
 
-            STORE_RELAXED(LEAF_VALUES(child)[0], value);
+            /* key is the leaf's first key: this is an overwrite */
+            int put_leaf = leaf_upsert(child, key, value);
+            assert(put_leaf == BSL_UPDATED);
+            (void)put_leaf;
 
             NODE_WRITE_UNLOCK(child);
 
             for (int i = 0; i < level_to_promote; i++)
             {
-                if (new_nodes[i]) bsl_node_destroy(new_nodes[i]);
+                if (new_nodes[i]) bsl_node_free(new_nodes[i]);
             }
             return 1;
         } 
     }
 
-    node_header_t *parent_to_unlock = NULL;
+    bsl_node_t *parent_to_unlock = NULL;
     int num_split = 0;
+    bsl_node_t *left_child = NULL;
 
-    uint32_t max_key = (level == 0) ? B_LEAF : B_INTERNAL;
-    if (curr->num_elts + 1 > max_key)
+    if (level > 0)
+        put = internal_insert(curr, key, new_nodes[num_split], &left_child);
+
+    if (put == BSL_FULL)
     {
-        node_header_t *new_node = bsl_node_alloc();
+        bsl_node_t *new_node = (level == 0) ? bsl_leaf_alloc() : bsl_internal_alloc(level);
         NODE_WRITE_LOCK(new_node);
 
-        new_node->next = curr->next;
-        new_node->next_header = curr->next_header;
-        new_node->level = level;
+        node_set_next(new_node, node_next(curr));
+        node_set_next_header(new_node, node_next_header(curr));
 
-        int half_keys = curr->num_elts / 2;
-        
-        int elts_moved = split_keys(curr, new_node, half_keys, 0);
+        bsl_key_t split_key = node_split_half(curr, new_node);
 
-        STORE_RELAXED(curr->next_header, NODE_KEYS(new_node)[0]);
-        STORE_RELAXED(curr->next, new_node);
+        node_set_next_header(curr, split_key);
+        node_set_next(curr, new_node);
 
-        if (level > 0)
-        {
-            memmove(
-                INTERNAL_CHILDREN(new_node),
-                INTERNAL_CHILDREN(curr) + half_keys,
-                elts_moved * sizeof(void *)
-            ); 
-        }
-        else
-        {
-            memmove(
-                LEAF_VALUES(new_node),
-                LEAF_VALUES(curr) + half_keys,
-                elts_moved * sizeof(bsl_val_t)
-            );
-        }
-
-        if (rank + 1 <= curr->num_elts)
+        if (key < split_key)
         {
             NODE_WRITE_UNLOCK(new_node);
             assert(num_split == 0);
             if (level > 0)
             {
-                insert_internal_slot(curr, rank + 1, key, new_nodes[num_split]);
+                put = internal_insert(curr, key, new_nodes[num_split], &left_child);
+                assert(put == BSL_INSERTED);
                 parent_to_unlock = curr;
-                curr = INTERNAL_CHILDREN(curr)[rank];
+                curr = left_child;
             }
             else
             {
-                insert_leaf_slot(curr, rank + 1, key, value);
+                leaf_insert(curr, key, value);
                 NODE_WRITE_UNLOCK(curr);
                 return 1;
             }
         }
         else
         {
-            assert(new_node->num_elts > 0);
-            int rank_to_insert = rank - curr->num_elts;
-
             NODE_WRITE_UNLOCK(curr);
 
             if (level > 0)
             {
-                insert_internal_slot(new_node, rank_to_insert + 1, key, new_nodes[num_split]);
+                put = internal_insert(new_node, key, new_nodes[num_split], &left_child);
+                assert(put == BSL_INSERTED);
                 parent_to_unlock = new_node;
-                curr = (node_header_t *)INTERNAL_CHILDREN(new_node)[rank_to_insert];
+                curr = left_child;
             } else {
-                insert_leaf_slot(new_node, rank_to_insert + 1, key, value);
+                leaf_insert(new_node, key, value);
                 NODE_WRITE_UNLOCK(new_node);
                 return 1;
             }
@@ -320,11 +263,11 @@ top_retry:;
         assert(level_to_promote == level);
         if (level > 0)
         {
-            insert_internal_slot(curr, rank + 1, key, new_nodes[num_split]);
+            /* inserted by internal_insert above */
             parent_to_unlock = curr;
-            curr = (node_header_t *)INTERNAL_CHILDREN(curr)[rank];
+            curr = left_child;
         } else {
-            insert_leaf_slot(curr, rank + 1, key, value);
+            /* inserted by leaf_upsert above */
             NODE_WRITE_UNLOCK(curr);
             return 1;
         }
@@ -341,57 +284,34 @@ top_retry:;
             parent_to_unlock = NULL;
         }
 
-        node_header_t *prev = curr;
+        bsl_node_t *prev = curr;
 
-        while (curr->next_header <= key)
+        while (node_next_header(curr) <= key)
         {
-            NODE_WRITE_LOCK(curr->next);
+            NODE_WRITE_LOCK(node_next(curr));
             prev = curr;
-            curr = curr->next;
+            curr = node_next(curr);
             NODE_WRITE_UNLOCK(prev);
         }
 
-        bsl_key_t *keys = NODE_KEYS(curr);
-        int rank = find_rank_linear(keys, curr->num_elts, key);
-
         assert(level_to_promote > level);
-        node_header_t *new_node = (node_header_t *)new_nodes[num_split];
+        bsl_node_t *new_node = new_nodes[num_split];
         num_split++;
 
-        STORE_RELAXED(new_node->next_header, curr->next_header);
-        STORE_RELAXED(new_node->next, curr->next);
-        STORE_RELAXED(new_node->level, level);
+        node_set_next_header(new_node, node_next_header(curr));
+        node_set_next(new_node, node_next(curr));
 
         if (level > 0)
         {
-            insert_internal_slot(new_node, 0, key, new_nodes[num_split]);
+            internal_split_promote(curr, key, new_nodes[num_split], new_node);
         } 
         else
         {
-            insert_leaf_slot(new_node, 0, key, value);
-        }
-
-        uint32_t elts_moved = split_keys(curr, new_node, rank + 1, 1);
-
-        if (level > 0)
-        {
-            memmove(
-                INTERNAL_CHILDREN(new_node) + 1,
-                INTERNAL_CHILDREN(curr) + rank + 1,
-                elts_moved * sizeof(void *)
-            ); 
-        }
-        else
-        {
-            memmove(
-                LEAF_VALUES(new_node) + 1,
-                LEAF_VALUES(curr) + rank + 1,
-                elts_moved * sizeof(bsl_val_t)
-            );
+            leaf_split_promote(curr, key, value, new_node);
         }
         
-        STORE_RELAXED(curr->next_header, NODE_KEYS(new_node)[0]);
-        STORE_RELAXED(curr->next, new_node);
+        node_set_next_header(curr, node_first_key(new_node));
+        node_set_next(curr, new_node);
 
 
         /*
@@ -425,7 +345,7 @@ top_retry:;
         if (level > 0)
         {
             parent_to_unlock = curr;
-            curr = (node_header_t *)INTERNAL_CHILDREN(curr)[rank];
+            curr = internal_last_child(curr);
         }
         else
         {

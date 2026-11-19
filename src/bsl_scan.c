@@ -30,19 +30,23 @@ _bsl_scan_n_batch_optimistic(bsl_t *list, bsl_key_t start, size_t length, range_
     size_t remaining;
     bsl_key_t current_start;
 
+    /* Used only by layouts whose leaf_scan copies (LEAF_SCAN_BUFFER_ENTRIES > 0). */
+    bsl_key_t buf_keys[BSL_SCAN_BUFFER_LEN];
+    bsl_val_t buf_vals[BSL_SCAN_BUFFER_LEN];
+
 top_retry:
 
     remaining = length;
     current_start = start;
 
-    node_header_t *curr = list->headers[MAX_LEVEL - 1];
+    bsl_node_t *curr = list->headers[MAX_LEVEL - 1];
     hocc64_t curr_v = NODE_LOAD_VERSION(curr);
 
     for (int level = MAX_LEVEL - 1; level > 0; level--)
     {
-        while (LOAD_RELAXED(curr->next_header) <= current_start)
+        while (node_next_header(curr) <= current_start)
         {
-            node_header_t *next = LOAD_RELAXED(curr->next);
+            bsl_node_t *next = node_next(curr);
             if (!next)
             {
                 RECORD_RETRY();
@@ -61,8 +65,7 @@ top_retry:
             curr_v = next_v;
         }
 
-        int rank = find_rank(NODE_KEYS(curr), LOAD_RELAXED(curr->num_elts), current_start);
-        node_header_t *child = LOAD_RELAXED(INTERNAL_CHILDREN(curr)[rank]);
+        bsl_node_t *child = internal_route(curr, current_start);
         if (!child)
         {
             RECORD_RETRY();
@@ -88,9 +91,9 @@ top_retry:
         curr_v = child_v;
     }
     
-    while (LOAD_RELAXED(curr->next_header) <= current_start)
+    while (node_next_header(curr) <= current_start)
     {
-        node_header_t *next = LOAD_RELAXED(curr->next);
+        bsl_node_t *next = node_next(curr);
         if (!next)
         {
             RECORD_RETRY();
@@ -109,68 +112,26 @@ top_retry:
         curr_v = next_v;
     }
 
-    leaf_node_t *leaf = (leaf_node_t *)curr;
-
-    int num_elts = LOAD_RELAXED(leaf->header.num_elts);
-    int rank = find_rank(leaf->keys, num_elts, current_start);
-
-    if (!NODE_VALIDATE(leaf, curr_v) || (curr_v & HOCC_WRITER_BIT)) {
-        RECORD_RETRY("Leaf changed after rank");
-        goto top_retry;
-    }
-
-    if (LOAD_RELAXED(leaf->keys[rank]) != current_start ||
-        (current_start == BSL_KEY_MIN && leaf == (leaf_node_t *)list->headers[0]))
-        rank++;
-
-    // if rank points past this leaf, move to next leaf
-    if (rank >= num_elts)
-    {
-        leaf_node_t *next = (leaf_node_t *)LOAD_ACQUIRE(leaf->header.next);
-
-        if (leaf->header.next_header == BSL_KEY_MAX)
-            return length - remaining;
-
-        if (!next) {
-            RECORD_RETRY();
-            goto top_retry;
-        }
-
-        hocc64_t next_v = NODE_LOAD_VERSION(next);
-
-        if (!NODE_VALIDATE(leaf, curr_v) || (curr_v & HOCC_WRITER_BIT)) {
-            RECORD_RETRY("Leaf changed before moving next");
-            goto top_retry;
-        }
-
-        leaf = next;
-        curr_v = next_v;
-        rank = 0;
-    }
+    /* One loop for all leaves; a scan from 0 starts at 1, past the head sentinel. */
+    bsl_node_t *leaf = curr;
+    const bsl_key_t from = (current_start == BSL_KEY_MIN) ? BSL_KEY_MIN + 1 : current_start;
 
     while (remaining)
     {
-        int num = LOAD_RELAXED(leaf->header.num_elts);
-
-        if (rank < 0 || rank > num) {
-            RECORD_RETRY("Invalid rank in leaf");
-            goto top_retry;
-        }
+        const bsl_key_t *keys;
+        const bsl_val_t *vals;
+        size_t batch_size = leaf_scan(leaf, from, remaining, buf_keys, buf_vals, &keys, &vals);
 
         if (!NODE_VALIDATE(leaf, curr_v) || (curr_v & HOCC_WRITER_BIT)) {
             RECORD_RETRY("Leaf changed before batch");
             goto top_retry;
         }
 
-        size_t batch_size = num - rank;
-        if (remaining < batch_size)
-            batch_size = remaining;
-
         if (batch_size > 0)
         {
             bsl_range_t range = {
-                .keys = &leaf->keys[rank],
-                .vals = &leaf->values[rank],
+                .keys = keys,
+                .vals = vals,
                 .count = batch_size,
                 .offset = length - remaining
             };
@@ -193,8 +154,8 @@ top_retry:
             break;
         }
 
-        bsl_key_t next_header = LOAD_RELAXED(leaf->header.next_header);
-        leaf_node_t *next = (leaf_node_t *)LOAD_ACQUIRE(leaf->header.next);
+        bsl_key_t next_header = node_next_header(leaf);
+        bsl_node_t *next = node_next_acquire(leaf);
 
         if (!NODE_VALIDATE(leaf, curr_v)) {
             RECORD_RETRY("Leaf changed before forward");
@@ -218,7 +179,6 @@ top_retry:
             goto top_retry;
         }
 
-        rank = 0;
         leaf = next;
         curr_v = next_v;
     }

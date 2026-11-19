@@ -20,15 +20,15 @@ _bsl_get_value(bsl_t *list, bsl_key_t key, bsl_val_t *out_val)
         return 0;
 
 top_retry:;
-    node_header_t *curr   = (node_header_t *)list->headers[MAX_LEVEL - 1];
-    hocc64_t       curr_v = NODE_LOAD_VERSION(curr);
+    bsl_node_t *curr   = list->headers[MAX_LEVEL - 1];
+    hocc64_t    curr_v = NODE_LOAD_VERSION(curr);
 
     for (int i = MAX_LEVEL - 1; i >= 0; i--)
     {
         /* Horizontal traversal */
-        while (LOAD_RELAXED(curr->next_header) <= key)
+        while (node_next_header(curr) <= key)
         {
-            node_header_t *next = LOAD_RELAXED(curr->next);
+            bsl_node_t *next = node_next(curr);
             if (!next)
             {
                 RECORD_RETRY();
@@ -57,16 +57,11 @@ top_retry:;
             goto top_retry;
         }
 
-        int        num  = LOAD_RELAXED(curr->num_elts);
-        bsl_key_t *keys = NODE_KEYS(curr);
-        int        rank = find_rank(keys, num, key);
-
         if (i == 0) /* Leaf level */
         {   
-            if (keys[rank] == key)
+            bsl_val_t v;
+            if (leaf_lookup(curr, key, &v))
             {
-                bsl_val_t v = LEAF_VALUES(curr)[rank];
-
                  __atomic_thread_fence(__ATOMIC_ACQUIRE); /* for arm arch, no effect on x86 */
                 if (!NODE_VALIDATE(curr, curr_v))
                 {
@@ -79,7 +74,7 @@ top_retry:;
                 return 1;
             } 
             
-            /* Prevent keys[rank] load from being reordered after NODE_VALIDATE */
+            /* Prevent the key loads of leaf_lookup from being reordered after NODE_VALIDATE */
             __atomic_thread_fence(__ATOMIC_ACQUIRE);  /* for arm arch, no effect on x86 */
             if (!NODE_VALIDATE(curr, curr_v))
             {
@@ -91,8 +86,7 @@ top_retry:;
         }
         else  /* Internal level: drop down */
         {
-            void          **children = INTERNAL_CHILDREN(curr);
-            node_header_t  *child    = (node_header_t *)LOAD_RELAXED(children[rank]);
+            bsl_node_t *child = internal_route(curr, key);
             if (!child)
             {
                 RECORD_RETRY();

@@ -1,6 +1,15 @@
 ROOT        = ..
-BUILD_DIR   = $(ROOT)/build
 INC_DIR     = $(ROOT)/include
+
+# LAYOUT=path/to/layout.h tests that layout's library, as ../Makefile builds it.
+LAYOUT      ?=
+ifneq ($(LAYOUT),)
+    LAYOUT_ABS := $(abspath $(LAYOUT))
+    ifneq ($(LAYOUT_ABS),$(abspath $(INC_DIR)/layout/baseline.h))
+        LAYOUT_TAG = $(basename $(notdir $(LAYOUT)))
+    endif
+endif
+BUILD_DIR   = $(ROOT)/build$(if $(LAYOUT_TAG),/$(LAYOUT_TAG))
 
 CGO_CFLAGS_VAL  = -I$(abspath $(INC_DIR))
 CGO_LDFLAGS_VAL = -L$(abspath $(BUILD_DIR)) -lbskiplist -lpthread -lm
@@ -12,7 +21,7 @@ GO := $(shell command -v go 2>/dev/null)
 all: check
 
 lib:
-	$(MAKE) -C $(ROOT)
+	$(MAKE) -C $(ROOT) $(if $(LAYOUT),LAYOUT=$(LAYOUT_ABS))
 
 tidy:
 ifndef GO

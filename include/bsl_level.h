@@ -1,11 +1,10 @@
 #ifndef BSL_LEVEL
 #define BSL_LEVEL
 
-#include "node.h"
 #include "params.h"
 #include <stdint.h>
 
-#define BSL_P_LEVEL ((uint64_t)(B_INTERNAL / PROMOTE_RATE_SCALE))
+#define BSL_P_LEVEL ((uint64_t)BSL_PROMOTE_DENOM)
 
 static inline uint64_t hash_64(uint64_t x)
 {

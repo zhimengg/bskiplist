@@ -14,15 +14,13 @@
 #define CACHE_ALIGNED __attribute__((aligned(CACHE_LINE_SIZE)))
 
 /*
- * GC_NEXT - access the intrusive next pointer embedded at the tail of a node.
+ * GC_NEXT - access the intrusive next pointer embedded in a node.
  *
- * Instead of a wrapper struct, we reuse NODE_GC_NEXT_OFFSET bytes at the end
- * of each node to link the pending reclamation list. This eliminates per-retire
- * malloc overhead and indirect function calls through a free callback.
- * node.h guarantees via STATIC_ASSERT that this region does not overlap
- * with valid keys, values, or children.
+ * Instead of a wrapper struct, we reuse a field of each node (node_retire_link)
+ * to link the pending reclamation list. This eliminates per-retire malloc
+ * overhead and indirect function calls through a free callback.
  */
-#define GC_NEXT(ptr) (*(void**)((char*)(ptr) + NODE_GC_NEXT_OFFSET))
+#define GC_NEXT(ptr) (*node_retire_link(ptr))
 
 /* ------------------------------------------------------------------ */
 /* Lock-free MPSC stack                                               */
@@ -138,7 +136,7 @@ static void reclaim_list(void *list)
     while (list)
     {
         void *next = GC_NEXT(list);
-        bsl_node_destroy(list);
+        bsl_node_free(list);
 #ifdef DEBUG
         FETCH_ADD_RELAXED(g_stat_reclaimed, 1L);
 #endif
