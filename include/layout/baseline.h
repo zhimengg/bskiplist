@@ -14,6 +14,11 @@
 #include "util.h"
 #include "hocc64.h"
 
+#define LAYOUT_NAME "baseline"
+
+/* The retirement link overlaps the last value/child slot. */
+#define LAYOUT_RETIRE_LINK_SHARED 1
+
 #define NODE_SIZE 2080
 
 /* Node memory and in-node search: the original include/node.h. */
@@ -56,6 +61,8 @@ STATIC_ASSERT(NODE_GC_NEXT_OFFSET >= INTERNAL_CHILDREN_OFFSET);
 
 #define LEAF_MAX_ENTRIES     B_LEAF
 #define INTERNAL_MAX_ENTRIES B_INTERNAL
+#define LEAF_NODE_BYTES      NODE_SIZE
+#define INTERNAL_NODE_BYTES  NODE_SIZE
 
 /* leaf_scan returns views into the node. */
 #define LEAF_SCAN_BUFFER_ENTRIES 0

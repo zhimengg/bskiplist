@@ -26,6 +26,7 @@ enum {
 #define BSL_LAYOUT_HEADER "layout/baseline.h"
 #endif
 #include BSL_LAYOUT_HEADER
+#include "layout_kit/contract_check.h"
 
 /* Length of the leaf_scan buffers; at least 1 (no zero-length arrays). */
 #define BSL_SCAN_BUFFER_LEN (LEAF_SCAN_BUFFER_ENTRIES > 0 ? LEAF_SCAN_BUFFER_ENTRIES : 1)
