@@ -19,7 +19,11 @@
 /* The retirement link overlaps the last value/child slot. */
 #define LAYOUT_RETIRE_LINK_SHARED 1
 
+#ifdef BSL_LAYOUT_SMALL
+#define NODE_SIZE 160     /* CONFIG=small: 32-byte header + 8 entries of 16 bytes */
+#else
 #define NODE_SIZE 2080
+#endif
 
 /* Node memory and in-node search: the original include/node.h. */
 
